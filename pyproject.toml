@@ -1,0 +1,15 @@
+[project]
+name = "program"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "deepface>=0.0.93",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.9.3",
+    "numpy==1.26.4",
+    "tensorflow-gpu>=2.11.0",
+    "tensorrt-bindings>=8.6.1",
+    "tensorrt>=10.7.0",
+]
