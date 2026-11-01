@@ -1,6 +1,6 @@
 """登録メンバーの顔判別 API。
 
-    uv sync --extra gpu        # 最初に 1 回（CPU のみなら --extra cpu）
+    ./setup_env.sh gpu         # 最初に 1 回（CPU のみなら cpu）
     ./run_server.sh
 
 環境変数

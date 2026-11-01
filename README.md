@@ -4,19 +4,26 @@ InsightFace（buffalo_l：SCRFD で顔検出 + ArcFace で特徴量）を使い�
 
 ## セットアップ（uv）
 
-最初に 1 回，使う runtime を選んで環境を作る。
+最初に 1 回，使う runtime を選んで環境を作る。切り替えるときも同じコマンドを使う。
 
 ```bash
-uv sync --extra gpu   # NVIDIA GPU（onnxruntime-gpu と CUDA / cuDNN を pip で導入。ホスト側は NVIDIA ドライバーのみ必要）
-uv sync --extra cpu   # CPU のみ
+./setup_env.sh gpu        # NVIDIA GPU, CUDA 13 版（onnxruntime-gpu と CUDA / cuDNN を pip で導入。ホスト側は NVIDIA ドライバーのみ必要）
+./setup_env.sh gpu-cu12   # NVIDIA GPU, CUDA 12 版（nvidia-smi の CUDA Version が 12.x のマシン。onnxruntime-gpu 1.26）
+./setup_env.sh cpu        # CPU のみ
 ```
+
+`gpu` と `gpu-cu12` のどちらを使うかは `nvidia-smi` 右上の `CUDA Version` で決める（13.0 以上なら `gpu`，12.x なら `gpu-cu12`）。
 
 以降は `uv run ...` を extras なしで使えば，選んだ runtime のまま動く（`uv run` はパッケージを追加するだけで削除はしないため）。
 
 初回実行時に buffalo_l（約 280MB）が `~/.insightface/models/` にダウンロードされる。
 
-> **extras なしの `uv sync` は使わない。** `uv sync` は環境を指定どおりに揃えるため，extras を付けないと onnxruntime が削除される。
-> cpu / gpu を切り替えるときも `uv sync --extra cpu` のように `uv sync` で行う（`uv run --extra` だと前の onnxruntime が残り，混在する）。
+> **素の `uv sync` と `uv run --extra ...` は使わない。**
+> - extras なしの `uv sync` は onnxruntime を削除する
+> - `uv run --extra gpu` は CPU 版を残したまま GPU 版を追加し，両方入った状態になる
+>
+> onnxruntime と onnxruntime-gpu は同じ `onnxruntime/` にファイルを置くため，両方入った状態から片方を消すと残った方も壊れる
+> （`module 'onnxruntime' has no attribute 'InferenceSession'` などになる）。`setup_env.sh` は選んだ方を入れ直すので，壊れたときもこれで直る。
 
 ### 環境チェック
 
@@ -40,7 +47,7 @@ uv run python build_gallery.py --eval
 ## サーバー
 
 ```bash
-./run_server.sh                    # uv sync で選んだ runtime のまま起動（port 18381）
+./run_server.sh                    # setup_env.sh で選んだ runtime のまま起動（port 18381）
 NOGI_RUNTIME=cpu ./run_server.sh   # runtime を cpu に入れ替えてから起動（以降はそのまま cpu）
 ```
 

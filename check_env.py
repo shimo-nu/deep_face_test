@@ -1,6 +1,6 @@
 """推論サーバーを動かせる環境かを順番に確認する。
 
-    uv sync --extra gpu   # 最初に 1 回（CPU のみなら --extra cpu）
+    ./setup_env.sh gpu    # 最初に 1 回（CPU のみなら cpu）
     uv run python check_env.py
     uv run python check_env.py --image photo.jpg
 """
@@ -74,14 +74,22 @@ def check_packages(ctx):
     missing = [n for n in ("insightface", "opencv-python-headless", "numpy", "fastapi", "uvicorn") if not vers[n]]
     if missing:
         status = NG
-        notes.append(f"未インストール: {', '.join(missing)}  (uv sync --extra gpu|cpu)")
+        notes.append(f"未インストール: {', '.join(missing)}  (./setup_env.sh gpu|cpu)")
     if vers["onnxruntime"] and vers["onnxruntime-gpu"]:
         status = NG
-        notes.append("onnxruntime と onnxruntime-gpu が両方入っています。"
-                     "uv sync --extra gpu --reinstall-package onnxruntime-gpu で入れ直してください")
+        notes.append("onnxruntime と onnxruntime-gpu が両方入っています。./setup_env.sh gpu（または cpu）で入れ直してください")
     elif not (vers["onnxruntime"] or vers["onnxruntime-gpu"]):
         status = NG
-        notes.append("onnxruntime が入っていません。uv sync --extra gpu（または --extra cpu）を実行してください")
+        notes.append("onnxruntime が入っていません。./setup_env.sh gpu（または cpu）を実行してください")
+    else:
+        # 両方入った状態から片方を消すと，共有の onnxruntime/ からファイルが消えて import だけ通る壊れた状態になる
+        import onnxruntime
+
+        if not hasattr(onnxruntime, "InferenceSession"):
+            status = NG
+            runtime = "gpu" if vers["onnxruntime-gpu"] else "cpu"
+            notes.append(f"onnxruntime のファイルが欠けています（CPU 版と GPU 版の入れ替えで壊れた状態）。"
+                         f"./setup_env.sh {runtime} で入れ直してください")
     if vers["opencv-python"]:
         status = max(status, WARN, key=[OK, WARN, NG].index)
         notes.append("opencv-python と opencv-python-headless が両方入っています")
@@ -155,9 +163,14 @@ def check_onnxruntime(ctx):
     need, have = _major_minor(rt_cuda), _major_minor(ctx.get("driver_cuda"))
     if need and have and have[0] < need[0]:
         status = NG
-        notes.append(f"ドライバーが対応する CUDA {ctx['driver_cuda']} < 必要な CUDA {need[0]}.x 。NVIDIA ドライバーを更新してください")
+        notes.append(f"ドライバーが対応する CUDA {ctx['driver_cuda']} < 必要な CUDA {need[0]}.x")
+        if have[0] == 12:
+            notes.append("./setup_env.sh gpu-cu12 で CUDA 12 版の onnxruntime-gpu に切り替えるか，"
+                         "NVIDIA ドライバーを 580 以上に更新してください")
+        else:
+            notes.append("NVIDIA ドライバーを更新してください")
     if not rt_cuda or not cudnn:
-        status = WARN
+        status = max(status, WARN, key=[OK, WARN, NG].index)
         notes.append("pip の CUDA / cuDNN が見つかりません。システムの CUDA が使われます")
     try:
         ort.preload_dlls()
