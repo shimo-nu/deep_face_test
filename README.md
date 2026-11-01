@@ -4,26 +4,17 @@ InsightFace（buffalo_l：SCRFD で顔検出 + ArcFace で特徴量）を使い�
 
 ## セットアップ（uv）
 
-最初に 1 回，使う runtime を選んで環境を作る。切り替えるときも同じコマンドを使う。
-
 ```bash
-./setup_env.sh gpu        # NVIDIA GPU, CUDA 13 版（onnxruntime-gpu と CUDA / cuDNN を pip で導入。ホスト側は NVIDIA ドライバーのみ必要）
-./setup_env.sh gpu-cu12   # NVIDIA GPU, CUDA 12 版（nvidia-smi の CUDA Version が 12.x のマシン。onnxruntime-gpu 1.26）
-./setup_env.sh cpu        # CPU のみ
+uv sync
 ```
 
-`gpu` と `gpu-cu12` のどちらを使うかは `nvidia-smi` 右上の `CUDA Version` で決める（13.0 以上なら `gpu`，12.x なら `gpu-cu12`）。
+onnxruntime は GPU 版（onnxruntime-gpu 1.26，CUDA 12 向け）だけを使う。CUDA / cuDNN も pip で入るので，ホスト側は NVIDIA ドライバーだけあればよい。
+GPU / ドライバーが無いマシンでは自動的に CPU で実行される。初回実行時に buffalo_l（約 280MB）が `~/.insightface/models/` にダウンロードされる。
 
-以降は `uv run ...` を extras なしで使えば，選んだ runtime のまま動く（`uv run` はパッケージを追加するだけで削除はしないため）。
-
-初回実行時に buffalo_l（約 280MB）が `~/.insightface/models/` にダウンロードされる。
-
-> **素の `uv sync` と `uv run --extra ...` は使わない。**
-> - extras なしの `uv sync` は onnxruntime を削除する
-> - `uv run --extra gpu` は CPU 版を残したまま GPU 版を追加し，両方入った状態になる
+> 以前の手順で CPU 版 onnxruntime が入っていた環境や，`module 'onnxruntime' has no attribute ...` で動かない環境は，
+> `uv sync --reinstall-package onnxruntime-gpu` で直る（CPU 版と GPU 版は同じ `onnxruntime/` にファイルを置くため，混在すると壊れる）。
 >
-> onnxruntime と onnxruntime-gpu は同じ `onnxruntime/` にファイルを置くため，両方入った状態から片方を消すと残った方も壊れる
-> （`module 'onnxruntime' has no attribute 'InferenceSession'` などになる）。`setup_env.sh` は選んだ方を入れ直すので，壊れたときもこれで直る。
+> NVIDIA ドライバーを 580 以上（`nvidia-smi` の CUDA Version が 13.x）に更新した場合は，`pyproject.toml` の onnxruntime-gpu を `>=1.31` に上げてよい。
 
 ### 環境チェック
 
@@ -47,8 +38,7 @@ uv run python build_gallery.py --eval
 ## サーバー
 
 ```bash
-./run_server.sh                    # setup_env.sh で選んだ runtime のまま起動（port 18381）
-NOGI_RUNTIME=cpu ./run_server.sh   # runtime を cpu に入れ替えてから起動（以降はそのまま cpu）
+./run_server.sh   # port 18381（PORT=xxxx で変更）
 ```
 
 | エンドポイント | 内容 |

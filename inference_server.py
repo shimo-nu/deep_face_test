@@ -1,6 +1,5 @@
 """登録メンバーの顔判別 API。
 
-    ./setup_env.sh gpu         # 最初に 1 回（CPU のみなら cpu）
     ./run_server.sh
 
 環境変数

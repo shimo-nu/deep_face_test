@@ -1,6 +1,5 @@
 """推論サーバーを動かせる環境かを順番に確認する。
 
-    ./setup_env.sh gpu    # 最初に 1 回（CPU のみなら cpu）
     uv run python check_env.py
     uv run python check_env.py --image photo.jpg
 """
@@ -29,6 +28,7 @@ STATUS_TEXT = {
     SKIP: "[dim]スキップ.[/dim]",
 }
 LABEL_WIDTH = len("[onnxruntime]")
+REPAIR = "uv sync --reinstall-package onnxruntime-gpu"
 STATUS_WIDTH = 10
 
 
@@ -74,26 +74,24 @@ def check_packages(ctx):
     missing = [n for n in ("insightface", "opencv-python-headless", "numpy", "fastapi", "uvicorn") if not vers[n]]
     if missing:
         status = NG
-        notes.append(f"未インストール: {', '.join(missing)}  (./setup_env.sh gpu|cpu)")
-    if vers["onnxruntime"] and vers["onnxruntime-gpu"]:
+        notes.append(f"未インストール: {', '.join(missing)}  ({REPAIR})")
+    if vers["onnxruntime"]:
         status = NG
-        notes.append("onnxruntime と onnxruntime-gpu が両方入っています。./setup_env.sh gpu（または cpu）で入れ直してください")
-    elif not (vers["onnxruntime"] or vers["onnxruntime-gpu"]):
+        notes.append(f"CPU 版 onnxruntime が入っています（GPU 版と衝突します）。{REPAIR} で入れ直してください")
+    elif not vers["onnxruntime-gpu"]:
         status = NG
-        notes.append("onnxruntime が入っていません。./setup_env.sh gpu（または cpu）を実行してください")
+        notes.append(f"onnxruntime-gpu が入っていません。{REPAIR} を実行してください")
     else:
         # 両方入った状態から片方を消すと，共有の onnxruntime/ からファイルが消えて import だけ通る壊れた状態になる
         import onnxruntime
 
         if not hasattr(onnxruntime, "InferenceSession"):
             status = NG
-            runtime = "gpu" if vers["onnxruntime-gpu"] else "cpu"
-            notes.append(f"onnxruntime のファイルが欠けています（CPU 版と GPU 版の入れ替えで壊れた状態）。"
-                         f"./setup_env.sh {runtime} で入れ直してください")
+            notes.append(f"onnxruntime のファイルが欠けています（CPU 版と GPU 版が混在した後の壊れた状態）。"
+                         f"{REPAIR} で入れ直してください")
     if vers["opencv-python"]:
         status = max(status, WARN, key=[OK, WARN, NG].index)
         notes.append("opencv-python と opencv-python-headless が両方入っています")
-    ctx["ort_gpu_pkg"] = bool(vers["onnxruntime-gpu"])
     return status, info, notes
 
 
@@ -110,10 +108,9 @@ def _libcuda_error() -> str | None:
 
 def check_gpu(ctx):
     ctx["libcuda_error"] = _libcuda_error()
+    ctx["has_gpu"] = False
     if not shutil.which("nvidia-smi"):
         ctx["driver_cuda"] = None
-        if ctx.get("ort_gpu_pkg"):
-            return NG, {"nvidia-smi": "見つかりません"}, ["NVIDIA ドライバーが見つかりません。GPU を使うにはドライバーが必要です"]
         return WARN, {"nvidia-smi": "見つかりません"}, ["NVIDIA GPU / ドライバーが見つからないため CPU で動作します"]
     try:
         q = subprocess.run(
@@ -124,6 +121,7 @@ def check_gpu(ctx):
     except (subprocess.SubprocessError, OSError) as e:
         ctx["driver_cuda"] = None
         return NG, {"nvidia-smi": "実行失敗"}, [str(e)]
+    ctx["has_gpu"] = True
     m = re.search(r"CUDA Version:\s*([\d.]+)", header)
     ctx["driver_cuda"] = m[1] if m else None
     name, driver, mem = (s.strip() for s in q[0].split(","))
@@ -144,16 +142,12 @@ def check_onnxruntime(ctx):
     info = {"version": ort.__version__, "device": ort.get_device(),
             "providers": ", ".join(p.replace("ExecutionProvider", "") for p in providers)}
     notes = []
-    if not ctx.get("ort_gpu_pkg"):
-        ctx["expect_cuda"] = False
-        notes.append("CPU 版 onnxruntime を使用しています")
-        return OK, info, notes
-
-    ctx["expect_cuda"] = True
     rt_cuda = _version("nvidia-cuda-runtime") or _version("nvidia-cuda-runtime-cu12")
     cudnn = _version("nvidia-cudnn-cu13") or _version("nvidia-cudnn-cu12")
     info["cuda runtime (pip)"] = rt_cuda or "なし"
     info["cudnn (pip)"] = cudnn or "なし"
+    if not ctx.get("has_gpu"):
+        return OK, info, ["GPU が無いため CPU で実行します"]
     if "CUDAExecutionProvider" not in providers:
         return NG, info, ["onnxruntime-gpu に CUDAExecutionProvider がありません"]
     status = OK
@@ -163,12 +157,8 @@ def check_onnxruntime(ctx):
     need, have = _major_minor(rt_cuda), _major_minor(ctx.get("driver_cuda"))
     if need and have and have[0] < need[0]:
         status = NG
-        notes.append(f"ドライバーが対応する CUDA {ctx['driver_cuda']} < 必要な CUDA {need[0]}.x")
-        if have[0] == 12:
-            notes.append("./setup_env.sh gpu-cu12 で CUDA 12 版の onnxruntime-gpu に切り替えるか，"
-                         "NVIDIA ドライバーを 580 以上に更新してください")
-        else:
-            notes.append("NVIDIA ドライバーを更新してください")
+        notes.append(f"ドライバーが対応する CUDA {ctx['driver_cuda']} < 必要な CUDA {need[0]}.x 。"
+                     "NVIDIA ドライバーを更新するか，pyproject.toml の onnxruntime-gpu の版を下げてください")
     if not rt_cuda or not cudnn:
         status = max(status, WARN, key=[OK, WARN, NG].index)
         notes.append("pip の CUDA / cuDNN が見つかりません。システムの CUDA が使われます")
@@ -199,7 +189,7 @@ def check_model(ctx):
     used = app.det_model.session.get_providers()[0].replace("ExecutionProvider", "")
     ctx["used_provider"] = used
     info = {"model": MODEL_NAME, "dir": str(model_dir), "provider": used, "load": f"{elapsed:.1f}s"}
-    if ctx.get("expect_cuda") and used != "CUDA":
+    if ctx.get("has_gpu") and used != "CUDA":
         notes = ["onnxruntime-gpu なのに CPU にフォールバックしています（CUDA / cuDNN / ドライバーを確認）"]
         reasons = re.findall(r"with error: (.+)", captured.read())
         notes += sorted(set(reasons))[:3]

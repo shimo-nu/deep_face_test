@@ -5,6 +5,10 @@ description = "InsightFace (SCRFD + ArcFace) で登録メンバーを判別す�
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "insightface>=2.1",
+    # GPU 版だけを使う（GPU / ドライバーが無いマシンでは自動で CPU 実行になる）。
+    # 1.26 は CUDA 12 向けの最後の版。NVIDIA ドライバーを 580 以上（CUDA 13 対応）に
+    # 更新したら ">=1.31" に上げてよい
+    "onnxruntime-gpu[cuda,cudnn]>=1.26,<1.27",
     "numpy",
     "opencv-python-headless",
     "fastapi",
@@ -14,18 +18,10 @@ dependencies = [
     "rich>=15.0.0",
 ]
 
-[project.optional-dependencies]
-cpu = ["onnxruntime>=1.31"]
-gpu = ["onnxruntime-gpu[cuda,cudnn]>=1.31"]
-# CUDA 12 向けの onnxruntime-gpu は PyPI では 1.26 が最後（1.27 以降は CUDA 13）。
-# ドライバーが CUDA 13 に未対応（nvidia-smi の CUDA Version が 12.x）のマシン用
-gpu-cu12 = ["onnxruntime-gpu[cuda,cudnn]>=1.26,<1.27"]
-
 [tool.uv]
-conflicts = [[{ extra = "cpu" }, { extra = "gpu" }, { extra = "gpu-cu12" }]]
-# insightface は onnxruntime と opencv-python を必須で引き込むため，
-# extra 側で選んだ runtime / headless 版だけが入るように上書きする
+# insightface が必須で引き込む CPU 版 onnxruntime と opencv-python を入れない。
+# onnxruntime と onnxruntime-gpu は同じ onnxruntime/ にファイルを置くため，両方入ると壊れる
 override-dependencies = [
-    "onnxruntime>=1.31; extra == 'cpu'",
+    "onnxruntime; sys_platform == 'never'",
     "opencv-python; sys_platform == 'never'",
 ]

@@ -30,13 +30,26 @@ DEFAULT_TEMPERATURE = 0.05
 
 
 # ---------- モデル ----------
+def _has_nvidia_driver() -> bool:
+    import ctypes
+
+    try:
+        ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return False
+    return True
+
+
 def load_face_app(det_size=None, det_thresh: float = 0.5, providers=None):
     """検出と認識だけを読み込んだ FaceAnalysis を返す（初回はモデルを自動ダウンロード）。
 
     providers が None のときは CUDA → CPU の順で自動選択される。
+    NVIDIA ドライバーが無いマシンでは CUDA の読み込みエラーを出さないよう最初から CPU にする。
     """
     from insightface.app import FaceAnalysis
 
+    if providers is None and not _has_nvidia_driver():
+        providers = ["CPUExecutionProvider"]
     app = FaceAnalysis(
         name=MODEL_NAME,
         allowed_modules=["detection", "recognition"],

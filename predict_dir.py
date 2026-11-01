@@ -75,8 +75,8 @@ def print_device(app) -> str:
         name = gpu_name() or "不明な GPU"
         console.print(f"[bold cyan]\\[device][/bold cyan] [green]GPU (CUDA)[/green]  {escape(name)}")
     else:
-        note = "  [yellow](onnxruntime-gpu だが CUDA を使えず CPU にフォールバック)[/yellow]" \
-            if "CUDAExecutionProvider" in ort.get_available_providers() else ""
+        note = "  [yellow](GPU はあるが CUDA を使えず CPU にフォールバック。check_env.py で確認)[/yellow]" \
+            if gpu_name() else "  [dim](GPU なし)[/dim]"
         console.print(f"[bold cyan]\\[device][/bold cyan] [yellow]CPU[/yellow]{note}")
     console.print(f"[bold cyan]\\[model][/bold cyan]  {MODEL_NAME}  onnxruntime {ort.__version__}")
     return provider
