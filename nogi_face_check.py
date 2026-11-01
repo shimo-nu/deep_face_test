@@ -1,309 +1,256 @@
-# =======================
-# face_recognition 単独版：検出関数（＋任意の照合）
-# そのまま Jupyter で1セル実行OK
-# =======================
+"""InsightFace (SCRFD + ArcFace) による登録メンバーの顔判別。
+
+- 検出: SCRFD (buffalo_l の det_10g)
+- 特徴量: ArcFace (buffalo_l の w600k_r50, 512 次元)
+- 照合: 登録画像 1 枚ごとの特徴量とのコサイン類似度を NumPy で計算し，
+  メンバーごとの最大値をそのメンバーのスコアとする
+"""
+from __future__ import annotations
+
+import logging
+import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
-import os, hashlib
-import numpy as np
+
 import cv2
-import face_recognition
+import numpy as np
 
-# ---------- ユーティリティ ----------
+logger = logging.getLogger(__name__)
+# insightface の顔位置合わせが毎回出す scikit-image の非推奨警告を抑える
+warnings.filterwarnings("ignore", message="`estimate` is deprecated", category=FutureWarning)
+
+MODEL_NAME = "buffalo_l"
 VALID_EXTS = {".jpg", ".jpeg", ".png"}
+# 登録メンバーとして扱わないディレクトリ
+EXCLUDE_DIRS = {"preset_images_dir", "multipleFaces", "noFace"}
 
-def ensure_rgb_uint8(img):
-    arr = np.asarray(img)
-    if arr.ndim == 2:
-        arr = np.stack([arr]*3, axis=-1)
-    elif arr.ndim == 3 and arr.shape[2] == 4:
-        arr = arr[:, :, :3]
-    if arr.dtype != np.uint8:
-        arr = arr.astype(np.uint8, copy=False)
-    if not arr.flags["C_CONTIGUOUS"]:
-        arr = np.ascontiguousarray(arr)
-    return arr
+DEFAULT_MIN_SIM = 0.50
+DEFAULT_MIN_MARGIN = 0.05
+DEFAULT_TEMPERATURE = 0.05
 
-def l2_normalize(v, eps=1e-12):
-    v = np.asarray(v)
-    n = np.linalg.norm(v, axis=-1, keepdims=True)
-    return v / np.clip(n, eps, None)
 
-def cosine_sim(a, b):
-    a = l2_normalize(a); b = l2_normalize(b)
-    return np.dot(a, b.T)
+# ---------- モデル ----------
+def load_face_app(det_size=None, det_thresh: float = 0.5, providers=None):
+    """検出と認識だけを読み込んだ FaceAnalysis を返す（初回はモデルを自動ダウンロード）。
 
-# ---------- 顔エンコード ----------
-def _safe_face_locations(img_rgb):
-    locs = face_recognition.face_locations(img_rgb)
-    return [(int(t), int(r), int(b), int(l)) for (t,r,b,l) in locs]
+    providers が None のときは CUDA → CPU の順で自動選択される。
+    """
+    from insightface.app import FaceAnalysis
 
-def _encode_rgb(img_rgb, face_locations=None, num_jitters=2, do_flip_tta=True):
-    img_rgb = ensure_rgb_uint8(img_rgb)
-    if face_locations is None:
-        face_locations = _safe_face_locations(img_rgb)
-    embeddings = face_recognition.face_encodings(img_rgb, face_locations, num_jitters=num_jitters)
-    embeddings = np.asarray(embeddings, dtype=np.float32)
-    if do_flip_tta and len(embeddings):
-        img_flip = img_rgb[:, ::-1, :].copy()
-        w = img_rgb.shape[1]
-        locs_flip = [(t, w - l, b, w - r) for (t,r,b,l) in face_locations]
-        locs_flip = [(int(t), int(r), int(b), int(l)) for (t,r,b,l) in locs_flip]
-        emb_flip = face_recognition.face_encodings(img_flip, locs_flip, num_jitters=1)
-        if len(emb_flip) == len(embeddings):
-            embeddings = (embeddings + np.asarray(emb_flip, dtype=np.float32)) / 2.0
-    embeddings = l2_normalize(embeddings)
-    return embeddings, face_locations
+    app = FaceAnalysis(
+        name=MODEL_NAME,
+        allowed_modules=["detection", "recognition"],
+        providers=providers,
+    )
+    app.prepare(ctx_id=0, det_thresh=det_thresh, det_size=det_size)
+    det_session = getattr(app.det_model, "session", None)
+    if det_session is not None:
+        logger.info("onnxruntime providers: %s", det_session.get_providers())
+    return app
 
-def _auto_scale_encode(img_rgb, target_min_face_px=80, scales=(1.0,1.5,2.0), num_jitters=2):
-    H, W = img_rgb.shape[:2]
-    best = ([], [])
-    for s in scales:
-        img_s = img_rgb if s == 1.0 else cv2.resize(img_rgb, (int(W*s), int(H*s)), interpolation=cv2.INTER_LINEAR)
-        encs, locs = _encode_rgb(img_s, num_jitters=num_jitters, do_flip_tta=True)
-        if len(locs):
-            widths = [r - l for (t,r,b,l) in locs]
-            if max(widths) >= target_min_face_px:
-                if s != 1.0:
-                    locs = [(int(t/s), int(r/s), int(b/s), int(l/s)) for (t,r,b,l) in locs]
-                return encs, locs
-            best = (encs, [(int(t/s), int(r/s), int(b/s), int(l/s)) if s!=1.0 else (t,r,b,l) for (t,r,b,l) in locs])
-    return best
 
-# ---------- ギャラリー構築 ----------
-_DLIB_CACHE = {"sig": None, "templates": None, "dir": None, "person_thr": None}
+def decode_image(data: bytes) -> np.ndarray:
+    """画像バイト列を BGR uint8 に変換する（EXIF の回転も反映される）。"""
+    buf = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("画像としてデコードできません")
+    return img
 
-def _dir_signature(known_dir: Path):
-    h = hashlib.sha1()
-    for root, dirs, files in os.walk(known_dir):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        for f in sorted(files):
-            if f.startswith("."): continue
-            p = Path(root) / f
-            if p.suffix.lower() not in VALID_EXTS: continue
-            stat = p.stat()
-            h.update(str(p).encode()); h.update(str(int(stat.st_mtime)).encode())
-    return h.hexdigest()
 
-def _collect_known_images(known_dir: Path):
+def read_image(path: str | Path) -> np.ndarray:
+    return decode_image(Path(path).read_bytes())
+
+
+def _largest_face(faces):
+    return max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+
+
+# ---------- ギャラリー ----------
+@dataclass
+class Gallery:
+    names: np.ndarray  # (N,) 各特徴量のメンバー名
+    embeddings: np.ndarray  # (N, 512) L2 正規化済み
+    paths: np.ndarray  # (N,) 元画像のパス
+    members: list[str] = field(init=False)
+    _member_index: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self.members = sorted(set(self.names.tolist()))
+        lookup = {m: i for i, m in enumerate(self.members)}
+        self._member_index = np.array([lookup[n] for n in self.names], dtype=np.int64)
+
+    def __len__(self):
+        return len(self.names)
+
+    def counts(self) -> dict[str, int]:
+        return {m: int((self.names == m).sum()) for m in self.members}
+
+    def member_scores(self, query: np.ndarray, exclude: np.ndarray | None = None) -> np.ndarray:
+        """query (D,) に対するメンバーごとの最大コサイン類似度 (M,) を返す。"""
+        sims = self.embeddings @ query
+        if exclude is not None:
+            sims = np.where(exclude, -np.inf, sims)
+        scores = np.full(len(self.members), -np.inf, dtype=np.float32)
+        np.maximum.at(scores, self._member_index, sims)
+        return scores
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            path,
+            names=self.names,
+            embeddings=self.embeddings,
+            paths=self.paths,
+            model=np.array(MODEL_NAME),
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Gallery":
+        with np.load(path, allow_pickle=False) as d:
+            model = str(d["model"]) if "model" in d.files else None
+            if model != MODEL_NAME:
+                raise ValueError(f"{path} は {model} で作られています（現在のモデル: {MODEL_NAME}）")
+            return cls(names=d["names"], embeddings=d["embeddings"].astype(np.float32), paths=d["paths"])
+
+
+def collect_known_images(known_dir: str | Path) -> dict[str, list[Path]]:
+    """known_dir/<メンバー名>/*.jpg を {メンバー名: [画像パス]} にまとめる。"""
     people = {}
-    subdirs = [p for p in known_dir.iterdir() if p.is_dir() and not p.name.startswith(".")]
-    if subdirs:
-        for person_dir in sorted(subdirs):
-            imgs = []
-            for ext in VALID_EXTS:
-                imgs += list(person_dir.glob(f"*{ext}"))
-            imgs = [p for p in imgs if not p.name.startswith(".")]
-            if imgs:
-                people[person_dir.name] = imgs
-    else:
-        imgs = [p for p in known_dir.iterdir()
-                if p.is_file() and p.suffix.lower() in VALID_EXTS and not p.name.startswith(".")]
-        for p in imgs:
-            people.setdefault(p.stem, []).append(p)
+    for person_dir in sorted(Path(known_dir).iterdir()):
+        if not person_dir.is_dir() or person_dir.name.startswith(".") or person_dir.name in EXCLUDE_DIRS:
+            continue
+        imgs = sorted(
+            p for p in person_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in VALID_EXTS and not p.name.startswith(".")
+        )
+        if imgs:
+            people[person_dir.name] = imgs
     return people
 
-def _build_person_thresholds_robust(gallery: dict, percentile=0.98, floor=0.58, cap=0.84):
-    names = list(gallery.keys())
-    if not names:
-        return {}
-    G = np.vstack([gallery[n] for n in names])
-    thr = {}
-    for i, name in enumerate(names):
-        sims = np.dot(G[i], G.T); sims = np.delete(sims, i)
-        if sims.size == 0:
-            t = floor
-        else:
-            q = float(np.quantile(sims, percentile))
-            q25, q75 = np.percentile(sims, [25, 75])
-            iqr = q75 - q25
-            iqr_cap = q75 + 1.5 * iqr
-            t = min(q, iqr_cap)
-        thr[name] = float(np.clip(t, floor, cap))
-    return thr
 
-def build_gallery_face_recognition_cached(
-    known_dir: str | Path,
-    num_jitters: int = 1,
-    force_rebuild: bool = False,
-    person_thr_percentile: float = 0.98,
-    person_thr_floor: float = 0.58,
-    person_thr_cap: float = 0.84
-):
-    known_dir = Path(known_dir)
-    sig = _dir_signature(known_dir)
-    if (not force_rebuild) and _DLIB_CACHE["sig"] == sig and _DLIB_CACHE["dir"] == str(known_dir):
-        return _DLIB_CACHE["templates"], _DLIB_CACHE["person_thr"]
-    people = _collect_known_images(known_dir)
-    templates = {}
-    for name, paths in people.items():
-        vecs = []
-        for path in paths:
-            img = face_recognition.load_image_file(str(path))
-            img = ensure_rgb_uint8(img)
-            encs, _ = _auto_scale_encode(img, target_min_face_px=80, scales=(1.0,1.5,2.0), num_jitters=num_jitters)
-            if len(encs):
-                vecs.append(np.mean(encs, axis=0))
-        if vecs:
-            templates[name] = l2_normalize(np.mean(np.vstack(vecs), axis=0))
-    person_thr = _build_person_thresholds_robust(templates, percentile=person_thr_percentile,
-                                                 floor=person_thr_floor, cap=person_thr_cap)
-    _DLIB_CACHE.update({"sig": sig, "templates": templates, "dir": str(known_dir), "person_thr": person_thr})
-    print(f"[face_recognition] gallery loaded: {list(templates.keys())}")
-    return templates, person_thr
+def build_gallery(app, known_dir: str | Path) -> Gallery:
+    """登録画像から特徴量を作る。1 枚に複数の顔があるときは一番大きい顔を使う。"""
+    names, embs, paths = [], [], []
+    for name, img_paths in collect_known_images(known_dir).items():
+        for p in img_paths:
+            try:
+                faces = app.get(read_image(p))
+            except ValueError:
+                logger.warning("読み込めない画像をスキップ: %s", p)
+                continue
+            if not faces:
+                logger.warning("顔が見つからない画像をスキップ: %s", p)
+                continue
+            if len(faces) > 1:
+                logger.info("顔が %d 個あるため最大の顔を使用: %s", len(faces), p)
+            names.append(name)
+            embs.append(_largest_face(faces).normed_embedding)
+            paths.append(str(p))
+    if not embs:
+        raise RuntimeError(f"{known_dir} から顔を 1 つも登録できませんでした")
+    return Gallery(
+        names=np.array(names),
+        embeddings=np.vstack(embs).astype(np.float32),
+        paths=np.array(paths),
+    )
 
-# ---------- メイン関数（TOP3候補付き） ----------
-def detect_faces_face_recognition(
-    image,
-    known_dir: str | Path | None = None,
-    dlib_min_sim: float = 0.66,
-    dlib_min_margin: float = 0.03,
-    high_conf_override: float = 0.90,
-    
-    num_jitters_detect: int = 2,
-    topk_candidates: int = 3
-):
-    if isinstance(image, (str, Path)):
-        img_rgb = face_recognition.load_image_file(str(image))
-    else:
-        img_rgb = ensure_rgb_uint8(image)
 
-    encs, face_locations = _auto_scale_encode(img_rgb, target_min_face_px=80,
-                                              scales=(1.0,1.5,2.0), num_jitters=num_jitters_detect)
+# ---------- 判別 ----------
+def _softmax(x: np.ndarray, temperature: float) -> np.ndarray:
+    z = (x - x.max()) / temperature
+    e = np.exp(z)
+    return e / e.sum()
 
-    templates, person_thr = ({}, {})
-    if known_dir is not None:
-        templates, person_thr = build_gallery_face_recognition_cached(known_dir, num_jitters=1, force_rebuild=False)
 
-    names = list(templates.keys())
-    gal = np.vstack([templates[n] for n in names]) if names else None
+def classify(
+    scores: np.ndarray,
+    members: list[str],
+    min_sim: float = DEFAULT_MIN_SIM,
+    min_margin: float = DEFAULT_MIN_MARGIN,
+    temperature: float = DEFAULT_TEMPERATURE,
+    topk: int = 3,
+) -> dict:
+    """メンバーごとのスコアから名前・類似度・確率・候補を決める。
 
+    prob は登録メンバー内での相対的な確からしさ（類似度の softmax）で，
+    未登録の人物でも 1 に近くなり得るため，Unknown 判定には similarity を使う。
+    """
+    probs = _softmax(scores, temperature)
+    order = np.argsort(-scores)
+    top1 = float(scores[order[0]])
+    top2 = float(scores[order[1]]) if len(order) > 1 else -1.0
+    known = top1 >= min_sim and (top1 - top2) >= min_margin
+    return {
+        "name": members[order[0]] if known else "Unknown",
+        "similarity": top1,
+        "prob": float(probs[order[0]]),
+        "candidates": [
+            {"name": members[j], "similarity": float(scores[j]), "prob": float(probs[j])}
+            for j in order[:topk]
+        ],
+    }
+
+
+def identify(
+    app,
+    gallery: Gallery,
+    img_bgr: np.ndarray,
+    min_sim: float = DEFAULT_MIN_SIM,
+    min_margin: float = DEFAULT_MIN_MARGIN,
+    temperature: float = DEFAULT_TEMPERATURE,
+    topk: int = 3,
+) -> list[dict]:
+    """画像中の全ての顔を検出し，誰かを判別する。結果は左から順に並べる。"""
     results = []
-    for q, (t,r,b,l) in zip(encs, face_locations):
-        label, sim_best, candidates = "Unknown", 0.0, []
-        if gal is not None and len(gal) > 0:
-            sims = cosine_sim(q[None, :], gal)[0]
-            order = np.argsort(-sims)
-            topk = [(names[j], float(sims[j])) for j in order[:topk_candidates]]
-            j = int(order[0])
-            top1 = float(sims[j])
-            top2 = float(sims[order[1]]) if len(order) > 1 else -1.0
-
-            # 高確度オーバーライド
-            if top1 >= high_conf_override and (top1 - top2) >= dlib_min_margin * 0.5:
-                label, sim_best = names[j], top1
-            else:
-                ok = (top1 >= dlib_min_sim) and ((top1 - top2) >= dlib_min_margin) and \
-                     (top1 >= person_thr.get(names[j], dlib_min_sim))
-                label, sim_best = (names[j], top1) if ok else ("Unknown", top1)
-            candidates = topk
-        results.append({
-            'box': (int(t), int(r), int(b), int(l)),
-            'name': label,
-            'similarity': float(sim_best),
-            'candidates': candidates
-        })
+    for face in app.get(img_bgr):
+        x1, y1, x2, y2 = (int(round(v)) for v in face.bbox)
+        r = {"bbox": [x1, y1, x2, y2], "det_score": float(face.det_score)}
+        r.update(classify(gallery.member_scores(face.normed_embedding), gallery.members,
+                          min_sim, min_margin, temperature, topk))
+        results.append(r)
+    results.sort(key=lambda r: r["bbox"][0])
     return results
 
 
+# ---------- 描画 ----------
+KNOWN_COLOR = (0, 200, 0)  # BGR
+UNKNOWN_COLOR = (0, 140, 255)
 
 
-# =======================
-# visualize helpers for detect_faces_face_recognition
-# =======================
-from pathlib import Path
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-import face_recognition
-
-def _to_rgb(img_or_path):
-    """path でも ndarray でも受け取り、RGB ndarray にして返す"""
-    if isinstance(img_or_path, (str, Path)):
-        rgb = face_recognition.load_image_file(str(img_or_path))  # 既にRGB
-        return rgb
-    arr = np.asarray(img_or_path)
-    if arr.ndim == 3 and arr.shape[2] == 3:
-        # ユーザがBGRで渡してる可能性があるので、簡易判定でBGR→RGBを選択
-        # 迷ったら明示的に RGB で渡すのが安心。ここでは「そのままRGBとして扱う」方針にします。
-        return arr.astype(np.uint8, copy=False)
-    elif arr.ndim == 2:
-        return np.stack([arr]*3, axis=-1).astype(np.uint8, copy=False)
-    else:
-        raise ValueError("Unsupported image array format.")
-
-# ---------- visualize ----------
-def draw_results_on_image(rgb_img, results, box_color=(0,255,0), text_scale=0.7, text_thickness=2):
-    vis = rgb_img.copy()
+def draw_results(
+    img_bgr: np.ndarray,
+    results: list[dict],
+    show_candidates: bool = True,
+    candidate_min_sim: float = 0.30,
+) -> np.ndarray:
+    """BB と名前を描く。Unknown の顔には candidate_min_sim 以上の候補だけを添える。"""
+    vis = img_bgr.copy()
+    h, w = vis.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
     for r in results:
-        (t, rgt, btm, lft) = r['box']
-        name = r.get('name', 'Unknown')
-        sim  = r.get('similarity', 0.0)
-        cands = r.get('candidates', [])
-        # rectangle
-        cv2.rectangle(vis, (lft, t), (rgt, btm), box_color, 2)
-        # メインラベル
-        label = f"{name} ({sim*100:.1f}%)"
-        (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_thickness)
-        y1 = max(0, t - th - 6)
-        cv2.rectangle(vis, (lft, y1), (lft + tw + 6, y1 + th + 6), (0, 0, 0), -1)
-        cv2.putText(vis, label, (lft + 3, y1 + th + 3), cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0,255,0), text_thickness)
+        x1, y1, x2, y2 = r["bbox"]
+        # 文字の大きさは顔の幅に合わせる（集合写真でラベル同士が重なりにくくする）
+        scale = float(np.clip((x2 - x1) / 220, 0.4, max(0.5, min(w, h) / 900)))
+        thick = max(1, int(round(scale * 2)))
+        known = r["name"] != "Unknown"
+        color = KNOWN_COLOR if known else UNKNOWN_COLOR
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, thick + 1)
 
-        # # Unknown の場合、候補を下に
-        # if name == "Unknown" and cands:
-        #     offset = y1 + th + 8
-        #     for (cand_name, score) in cands:
-        #         txt = f"  → {cand_name} ({score*100:.1f}%)"
-        #         cv2.putText(vis, txt, (lft + 3, offset), cv2.FONT_HERSHEY_SIMPLEX, text_scale*0.7, (0,200,255), 1)
-        #         offset += int(th*0.9)
+        lines = [f"{r['name']} {r['similarity']:.2f}"]
+        if not known and show_candidates:
+            lines += [f"? {c['name']} {c['similarity']:.2f}"
+                      for c in r["candidates"][:3] if c["similarity"] >= candidate_min_sim]
+        sizes = [cv2.getTextSize(t, font, scale, thick)[0] for t in lines]
+        line_h = max(th for _, th in sizes) + int(8 * scale)
+        box_w = max(tw for tw, _ in sizes) + int(8 * scale)
+        box_h = line_h * len(lines)
+        # ラベルは枠の上に置き，はみ出す場合は枠の下に置く
+        top = y1 - box_h if y1 - box_h >= 0 else min(y2, h - box_h)
+        left = min(max(0, x1), max(0, w - box_w))
+        cv2.rectangle(vis, (left, top), (left + box_w, top + box_h), color, -1)
+        for i, text in enumerate(lines):
+            y = top + line_h * (i + 1) - int(5 * scale)
+            cv2.putText(vis, text, (left + int(4 * scale), y), font, scale, (0, 0, 0), thick, cv2.LINE_AA)
     return vis
-
-def visualize_detection(image, res, title=None, save_path=None, dpi=120):
-    """
-    image: 画像パス or RGB ndarray
-    res: detect_faces_face_recognition の返り値
-    title: 図タイトル（任意）
-    save_path: 保存先（任意）。指定したらPNGで保存
-    """
-    rgb = _to_rgb(image)
-    vis = draw_results_on_image(rgb, res)
-    plt.figure(figsize=(8, 8), dpi=dpi)
-    plt.imshow(vis)
-    if title: plt.title(title)
-    plt.axis("off")
-    if save_path:
-        # matplotlib から保存すると色ずれなし（RGBのまま）
-        plt.savefig(save_path, bbox_inches="tight", pad_inches=0.0)
-        print(f"saved: {save_path}")
-    plt.show()
-
-def visualize_directory(input_dir, known_dir=None, glob_exts=("*.jpg","*.png"), cols=2, dpi=120,
-                        dlib_min_sim=0.66, dlib_min_margin=0.03, high_conf_override=0.90):
-    """
-    ディレクトリ内の画像をグリッドで可視化
-    """
-    paths = []
-    p = Path(input_dir)
-    for pat in glob_exts:
-        paths += list(p.glob(pat))
-    paths = sorted(paths)
-    if not paths:
-        print("画像が見つかりません"); return
-
-    # 行列数
-    n = len(paths)
-    rows = (n + cols - 1) // cols
-
-    plt.figure(figsize=(8*cols, 6*rows), dpi=dpi)
-    for i, fp in enumerate(paths, 1):
-        res = detect_faces_face_recognition(
-            str(fp),
-            known_dir=known_dir,
-            dlib_min_sim=dlib_min_sim,
-            dlib_min_margin=dlib_min_margin,
-            high_conf_override=high_conf_override
-        )
-        rgb = _to_rgb(str(fp))
-        vis = draw_results_on_image(rgb, res)
-        ax = plt.subplot(rows, cols, i)
-        ax.imshow(vis); ax.set_title(fp.name); ax.axis("off")
-    plt.tight_layout(); plt.show()

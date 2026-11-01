@@ -1,5 +1,5 @@
 # Python-generated files
-/__pycache__/
+__pycache__/
 *.py[oc]
 build/
 dist/
@@ -7,7 +7,13 @@ wheels/
 *.egg-info
 
 /.cache/*
-/.ipynb_checkouts/*
+/.ipynb_checkpoints/*
 
 # Virtual environments
-.venv
+.venv*
+
+# データ・生成物
+/nogi_member_face/
+/gallery.npz
+/uploads/
+/out/

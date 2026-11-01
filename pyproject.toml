@@ -1,0 +1,28 @@
+[project]
+name = "nogi-face"
+version = "0.1.0"
+description = "InsightFace (SCRFD + ArcFace) で登録メンバーを判別する推論サーバー"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "insightface>=2.1",
+    "numpy",
+    "opencv-python-headless",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "requests",
+    "rich>=15.0.0",
+]
+
+[project.optional-dependencies]
+cpu = ["onnxruntime>=1.31"]
+gpu = ["onnxruntime-gpu[cuda,cudnn]>=1.31"]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]
+# insightface は onnxruntime と opencv-python を必須で引き込むため，
+# extra 側で選んだ runtime / headless 版だけが入るように上書きする
+override-dependencies = [
+    "onnxruntime>=1.31; extra == 'cpu'",
+    "opencv-python; sys_platform == 'never'",
+]
